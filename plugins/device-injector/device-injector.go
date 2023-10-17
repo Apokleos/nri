@@ -18,9 +18,12 @@ package main
 
 import (
 	"context"
+	b64 "encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -35,12 +38,30 @@ const (
 	deviceKey = "devices.nri.io"
 	// Prefix of the key used for mount annotations.
 	mountKey = "mounts.nri.io"
+
+	// Mount info config file name
+	mountInfoJson = "mountInfo.json"
+	// Kata-Containers direct-volume shared path
+	kataDirectVolumeSharedPath = "/run/kata-containers/shared/direct-volumes"
 )
 
 var (
 	log     *logrus.Logger
 	verbose bool
 )
+
+type DirectVolumeMountInfo struct {
+	// The type of the volume (ie. directvol)
+	VolumeType string `json:"volume_type"`
+	// The device for the volume.
+	Device string `json:"device"`
+	// The filesystem type to be mounted on the volume.
+	FsType string `json:"fs_type"`
+	// Additional metadata to pass to the agent regarding this volume.
+	Metadata map[string]string `json:"metadata,omitempty"`
+	// Additional mount options.
+	Options []string `json:"options,omitempty"`
+}
 
 // an annotated device
 type device struct {
@@ -54,7 +75,7 @@ type device struct {
 }
 
 // an annotated mount
-type mount struct {
+type Mount struct {
 	Source      string   `json:"source"`
 	Destination string   `json:"destination"`
 	Type        string   `json:"type"`
@@ -66,12 +87,73 @@ type plugin struct {
 	stub stub.Stub
 }
 
+func VolumeMountInfo(volumePath string) (*DirectVolumeMountInfo, error) {
+	var mountInfo DirectVolumeMountInfo
+
+	mountInfoPath := filepath.Join(kataDirectVolumeSharedPath, b64.URLEncoding.EncodeToString([]byte(volumePath)), mountInfoJson)
+	if _, err := os.Stat(mountInfoPath); err != nil {
+		log.Warnf("VolumeMountInfo Stat mountInfo.json failed: %+v", err)
+		return nil, err
+	}
+
+	buf, err := os.ReadFile(mountInfoPath)
+	if err != nil {
+		log.Errorf("VolumeMountInfo ReadFile error: %+v", err)
+		return nil, err
+	}
+
+	if err := json.Unmarshal(buf, &mountInfo); err != nil {
+		log.Errorf("VolumeMountInfo Unmarshal error: %+v", err)
+		return nil, err
+	}
+
+	return &mountInfo, nil
+}
+
+func patchMounts(container *api.Container) ([]Mount, error) {
+	mounts := []Mount{}
+
+	for _, m := range container.Mounts {
+		if m.Type != "bind" {
+			// We only handle for bind mounts.
+			continue
+		}
+
+		mountInfo, e := VolumeMountInfo(m.Source)
+		if e != nil {
+			log.Infoln("failed to parse the mount info file for a direct assigned volume")
+			continue
+		}
+
+		var volumeType string
+		if mountInfo != nil {
+			volumeType = mountInfo.VolumeType
+		} else {
+			log.Warnf("VolumeMountInfo Source: %#v skipped.", m)
+			continue
+		}
+
+		mnt := Mount{
+			Type:        volumeType,
+			Destination: m.Destination,
+			Source:      m.Source,
+			Options:     []string{"rbind", "rw"},
+		}
+		mounts = append(mounts, mnt)
+
+		encodedpath := b64.URLEncoding.EncodeToString([]byte(mnt.Source))
+		log.Infof("%s: injected mount %q [%q] -> %q...", container.Name, mnt.Source, encodedpath, mnt.Destination)
+	}
+
+	return mounts, nil
+}
+
 // CreateContainer handles container creation requests.
 func (p *plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, container *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	var (
 		ctrName string
 		devices []device
-		mounts  []mount
+		mounts  []Mount
 		err     error
 	)
 
@@ -104,8 +186,8 @@ func (p *plugin) CreateContainer(_ context.Context, pod *api.PodSandbox, contain
 		}
 	}
 
-	// inject mounts to container
-	mounts, err = parseMounts(container.Name, pod.Annotations)
+	// inject mounts to container from annotations or mountInfo
+	mounts, err = parseMounts(container, pod.Annotations)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -162,16 +244,16 @@ func parseDevices(ctr string, annotations map[string]string) ([]device, error) {
 	return devices, nil
 }
 
-func parseMounts(ctr string, annotations map[string]string) ([]mount, error) {
+func parseMounts(container *api.Container, annotations map[string]string) ([]Mount, error) {
 	var (
 		key        string
 		annotation []byte
-		mounts     []mount
+		mounts     []Mount
 	)
 
 	// look up effective device annotation and unmarshal devices
 	for _, key = range []string{
-		mountKey + "/container." + ctr,
+		mountKey + "/container." + container.Name,
 		mountKey + "/pod",
 		mountKey,
 	} {
@@ -182,11 +264,18 @@ func parseMounts(ctr string, annotations map[string]string) ([]mount, error) {
 	}
 
 	if annotation == nil {
-		return nil, nil
+		log.Debugf("Try to patch Mounts from mountInfo.json")
+		return patchMounts(container)
 	}
 
 	if err := yaml.Unmarshal(annotation, &mounts); err != nil {
 		return nil, fmt.Errorf("invalid mount annotation %q: %w", key, err)
+	}
+
+	for _, m := range container.Mounts {
+		if m.Destination == mounts[0].Destination {
+			mounts[0].Source = m.Source
+		}
 	}
 
 	return mounts, nil
@@ -213,7 +302,7 @@ func (d *device) toNRI() *api.LinuxDevice {
 }
 
 // Convert a device to the NRI API representation.
-func (m *mount) toNRI() *api.Mount {
+func (m *Mount) toNRI() *api.Mount {
 	apiMnt := &api.Mount{
 		Source:      m.Source,
 		Destination: m.Destination,
